@@ -1,19 +1,25 @@
-"""CLI: python -m legal_rag {probe|crawl|reconcile|status|preprocess}"""
+"""CLI: python -m legal_rag {probe|crawl|reconcile|status|preprocess|chunk|embed|fp16}"""
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from collections import Counter
 from pathlib import Path
 
-from .config import LIST_QUERY, Paths
+from dotenv import load_dotenv
+
+from .chunking import run_chunk
+from .config import DEFAULT_EMBEDDING_BASE_URL, DEFAULT_EMBEDDING_MODEL, LIST_QUERY, Paths
 from .crawl import CrawlAborted, CrawlOptions, crawl, reconcile, retry_failed, status_name
+from .embedding import EmbeddingClient, EmbeddingError, run_embed
 from .preprocess import run_preprocess
 from .storage import Checkpoint, CheckpointMismatch, JsonlStore
 from .structure import build_provision_tree
 from .vbpl_client import VbplClient, VbplError
+from .vector_index import IndexMismatch, convert_fp16
 
 log = logging.getLogger("legal_rag")
 
@@ -182,8 +188,91 @@ def cmd_preprocess(args) -> int:
     return 0
 
 
+def cmd_chunk(args) -> int:
+    paths = Paths(Path(args.data_dir))
+    _setup_logging(args.verbose)
+    if not paths.processed_data.exists():
+        log.error("Không thấy %s. Chạy preprocess trước.", paths.processed_data)
+        return 1
+    # faiss_id = thứ tự chunk: chunk lại làm index cũ trỏ sai chunk
+    stale = [p for p in (paths.faiss_index, paths.faiss_fp16_index, paths.embed_skipped) if p.exists()]
+    if stale and not args.force:
+        log.error("Đã có %s dựng từ chunks.db hiện tại; chunk lại sẽ làm lệch faiss_id. "
+                  "Dùng --force để chunk lại và xoá các file này.", ", ".join(p.name for p in stale))
+        return 2
+    report = run_chunk(paths.processed_data, paths.index_dir)
+    for p in stale:
+        p.unlink()
+        log.warning("Đã xoá %s (dựng từ chunks.db cũ)", p)
+    _print_kv("Kết quả chunk", {
+        "văn bản đã đọc": report.docs_read,
+        "văn bản có chunk": report.docs_indexed,
+        "văn bản bị loại": dict(report.rejected) or "-",
+        "chunk": report.chunks,
+        "chunk chỉ có tiêu đề": report.title_only_chunks,
+        "chunk_id trùng": report.duplicate_chunk_ids,
+        "chunk dài nhất (ký tự)": report.longest_chunk_chars,
+        "output": paths.chunks_db,
+    })
+    return 0
+
+
+def cmd_embed(args) -> int:
+    paths = Paths(Path(args.data_dir))
+    _setup_logging(args.verbose)
+    if not paths.chunks_db.exists():
+        log.error("Không thấy %s. Chạy chunk trước.", paths.chunks_db)
+        return 1
+    load_dotenv()
+    client = EmbeddingClient(
+        base_url=args.base_url or os.getenv("EMBEDDING_BASE_URL") or DEFAULT_EMBEDDING_BASE_URL,
+        model=args.model or os.getenv("EMBEDDING_MODEL_NAME") or DEFAULT_EMBEDDING_MODEL,
+        api_key=os.getenv("EMBEDDING_API_KEY"),
+    )
+    log.info("Embedding: %s, model %s", client.url, client.model)
+    try:
+        report = run_embed(client, paths.chunks_db, paths.faiss_index, paths.embed_skipped,
+                           batch_size=args.batch_size, max_chunks=args.max_chunks, save_every=args.save_every)
+    except IndexMismatch as e:
+        log.error("%s", e)
+        return 2
+    _print_kv("Kết quả embed", {
+        "chunk trong chunks.db": report.total_chunks,
+        "đã có trong index trước đó": report.already_indexed,
+        "embed mới": report.embedded,
+        "bỏ qua (vượt context)": f"{report.skipped_too_long} mới, {report.previously_skipped} từ trước",
+        "vector trong index": f"{report.vectors} (dim {report.dim})",
+        "còn lại": report.remaining,
+        "output": paths.faiss_index,
+    })
+    if report.embedded and paths.faiss_fp16_index.exists():
+        log.warning("%s giờ đã cũ hơn faiss.index (SearchService ưu tiên đọc file fp16). "
+                    "Chạy `python -m legal_rag fp16`.", paths.faiss_fp16_index.name)
+    return 0
+
+
+def cmd_fp16(args) -> int:
+    paths = Paths(Path(args.data_dir))
+    _setup_logging(args.verbose)
+    if not paths.faiss_index.exists():
+        log.error("Không thấy %s. Chạy embed trước.", paths.faiss_index)
+        return 1
+    try:
+        report = convert_fp16(paths.faiss_index, paths.faiss_fp16_index)
+    except IndexMismatch as e:
+        log.error("%s", e)
+        return 2
+    _print_kv("Kết quả fp16", {
+        "vector": f"{report.vectors} (dim {report.dim})",
+        f"recall@{report.top_k} so với float32": f"{report.recall:.4f} ({report.queries} query)",
+        "latency float32 / fp16": f"{report.latency_ms_float32:.1f} / {report.latency_ms_fp16:.1f} ms/query",
+        "output": f"{paths.faiss_fp16_index} ({report.size_mb:.0f} MB)",
+    })
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m legal_rag", description="Crawl + preprocess VBPL")
+    parser = argparse.ArgumentParser(prog="python -m legal_rag", description="Crawl, preprocess, chunk, embed VBPL")
     parser.add_argument("--data-dir", default="data", help="thư mục dữ liệu (mặc định: ./data)")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -218,6 +307,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("preprocess", help="Phase 2: khử trùng, lọc, dựng cây mục lục")
     p.set_defaults(func=cmd_preprocess)
+
+    p = sub.add_parser("chunk", help="Phase 3: processed_data.json → chunks.db (Điều/Khoản/Điểm)")
+    p.add_argument("--force", action="store_true", help="chunk lại dù đã có index (xoá index cũ)")
+    p.set_defaults(func=cmd_chunk)
+
+    p = sub.add_parser("embed", help="Phase 4: chunks.db → faiss.index (resume được)")
+    p.add_argument("--base-url", default=None, help="mặc định: $EMBEDDING_BASE_URL hoặc " + DEFAULT_EMBEDDING_BASE_URL)
+    p.add_argument("--model", default=None, help="mặc định: $EMBEDDING_MODEL_NAME hoặc " + DEFAULT_EMBEDDING_MODEL)
+    p.add_argument("--batch-size", type=int, default=8, help="số chunk mỗi request embedding")
+    p.add_argument("--max-chunks", type=int, default=None, help="số chunk tối đa cho lần chạy này (demo)")
+    p.add_argument("--save-every", type=float, default=300.0, help="giây giữa 2 lần lưu index")
+    p.set_defaults(func=cmd_embed)
+
+    p = sub.add_parser("fp16", help="nén faiss.index → faiss_fp16.index (~1/2 RAM) + kiểm tra recall")
+    p.set_defaults(func=cmd_fp16)
     return parser
 
 
@@ -227,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except VbplError as e:
+    except (VbplError, EmbeddingError) as e:
         log.error("Lỗi API: %s", e)
         print(f"Lỗi API: {e}", file=sys.stderr)
         return 2

@@ -1,7 +1,13 @@
-# Legal RAG: Crawl + Preprocess VBPL
+# Legal RAG: Crawl → Preprocess → Chunk → Embed VBPL
 
-Viết lại Phase 1 (crawl) và Phase 2 (preprocess) của `R2AI2026-BUILD-AI-LEGAL-ASSISTANT/pipeline/crawl_preprocess.py`.
-Output `data/processed/processed_data.json` giữ đúng định dạng mà `chunk_embedding.py` (Phase 3) đang đọc.
+Viết lại pipeline dữ liệu của `R2AI2026-BUILD-AI-LEGAL-ASSISTANT/pipeline/`:
+
+| Repo cũ | Ở đây |
+|---|---|
+| `crawl_preprocess.py` (Phase 1-2) | `crawl`, `preprocess` |
+| `chunk_embedding.py` (Phase 3-4) + `optimize_data.py` (Phase 5) | `chunk`, `embed`, `fp16` |
+
+Output cuối (`chunks.db`, `faiss.index`, `faiss_fp16.index`) giữ đúng tên file và schema mà `services/Search.py` của repo cũ đang đọc.
 
 ## Chạy từng bước
 
@@ -31,7 +37,19 @@ python -m legal_rag crawl --retry-failed
 
 # 6. Preprocess: khử trùng, lọc hiệu lực, dựng cây mục lục
 python -m legal_rag preprocess
+
+# 7. Chunk: processed_data.json → data/index/chunks.db
+python -m legal_rag chunk
+
+# 8. Embed: chunks.db → data/index/faiss.index (cần server embedding, vd. LM Studio)
+python -m legal_rag embed --max-chunks 200      # demo
+python -m legal_rag embed                       # chạy lại = resume tới hết
+
+# 9. Nén index fp16 cho máy ít RAM (dựng lại sau mỗi lần embed)
+python -m legal_rag fp16
 ```
+
+Cấu hình embedding đọc từ biến môi trường hoặc file `.env` ở thư mục gốc, cùng tên biến với repo cũ (`EMBEDDING_BASE_URL`, `EMBEDDING_MODEL_NAME`, `EMBEDDING_API_KEY`). Có thể ghi đè bằng `--base-url`, `--model`. Model khi embed phải là model mà `services/Chat.py` dùng để embed query.
 
 Smoke test với API thật (2 request): `$env:RUN_LIVE="1"; pytest -m live`
 
@@ -56,13 +74,22 @@ data/
 │   ├── docs.jsonl        1 dòng = {doc_id, page, fetched_at, list_item, detail}
 │   ├── checkpoint.json   next_page, total, last_page, failed_pages, failed_docs
 │   └── crawl.log
-└── processed/
-    ├── processed_data.json   [ {...detail, "metadata": cây mục lục} ]  → đầu vào Phase 3
-    ├── error_items.json      văn bản bị loại + lý do
-    └── report.json           thống kê: trùng, lý do loại, số node theo cấp, id HTML lặp
+├── processed/
+│   ├── processed_data.json   [ {...detail, "metadata": cây mục lục} ]  → đầu vào Phase 3
+│   ├── error_items.json      văn bản bị loại + lý do
+│   └── report.json           thống kê: trùng, lý do loại, số node theo cấp, id HTML lặp
+└── index/
+    ├── chunks.db             SQLite: chunks(faiss_id, chunk_id, doc_id, doc_num, title, article, clause, content) + docs
+    ├── chunk_report.json     số chunk, văn bản bị loại, chunk chỉ có tiêu đề, chunk dài nhất
+    ├── chunk_errors.json     văn bản không tạo được chunk + lý do
+    ├── faiss.index           float32, IndexIDMap(IndexFlatIP), id = faiss_id. Bản gốc để resume
+    ├── embed_skipped.json    faiss_id → lý do (chunk vượt context model, không thử lại)
+    └── faiss_fp16.index      bản nén, SearchService ưu tiên đọc
 ```
 
-Để dùng với Phase 3 của repo cũ: copy `data/processed/processed_data.json` vào thư mục gốc repo đó rồi chạy `python pipeline/chunk_embedding.py phase3`.
+Để dùng với app của repo cũ: copy `chunks.db` và `faiss_fp16.index` (thêm `faiss.index` nếu máy dư RAM) từ `data/index/` vào `R2AI2026-BUILD-AI-LEGAL-ASSISTANT/data/`. Các file `chunks.json`, `faiss_id_map.json`, `chunk_map.json`, `doc_index_map.json`, `article_index_map.json`, `indexed_ids.json` không còn cần, vì `SearchService` không đọc chúng.
+
+`faiss_id` là số thứ tự chunk trong `chunks.db`, nên `chunk` từ chối chạy lại khi đã có index (`--force` để chunk lại và xoá index cũ).
 
 ## Khác với code cũ
 
@@ -83,9 +110,25 @@ Cây mục lục dựng từ HTML dùng cùng schema node (`id, title, level, pt
 
 **Đã đối chiếu với dữ liệu cũ** (Bộ luật Dân sự 91/2015/QH13, chạy `parse_document` của Phase 3 cũ lên output mới): 1.857/1.857 id phần tử khớp với cây vbpl.vn cũ, 1.767 chunk có `embed_text` giống hệt. Phần lệch đến từ VBPL sửa câu chữ (41), lỗi dòng nối tiếp của Phase 3 (49, xem dưới) và các chunk rỗng kiểu `Điều 256 - Mục 1` mà cây cũ lồng sai (59, cây mới không sinh ra).
 
-### Lưu ý cho Phase 3
+### Phase 3-5: gộp `chunk_embedding.py` + `optimize_data.py`
 
-HTML của VBPL tách một đơn vị thành nhiều `<p>` **cùng `id`** (dòng sau có `data-merged="true"`), ví dụ `Mục 1` + `NĂNG LỰC PHÁP LUẬT DÂN SỰ…`, hoặc `Điều 292. Biện pháp…` + `Các biện pháp bảo đảm… bao gồm:`. `structure.py` gộp chúng thành một node (`merged_rows` trong `report.json`). Nhưng `chunk_embedding.py` cũ vẫn duyệt từng `<p>`, và `id_to_el`/`node_full_title` giữ phần tử **cuối**. Hệ quả: chunk bị trùng `chunk_id` (17.927 id trong `chunks.db` cũ), tiêu đề Điều bị thay bằng dòng tiếp theo, và phần đầu của Khoản bị tách mất nội dung. Cần sửa ở Phase 3: gộp text của mọi phần tử cùng id theo thứ tự.
+Hai file cũ chồng chéo: cùng khai báo đường dẫn, Phase 3 ghi `chunks.json` + 4 file map JSON, rồi `optimize_data.py` đọc lại `chunks.json` + `faiss_id_map.json` chỉ để chép sang `chunks.db` và kiểm tra hai file có khớp thứ tự không. Giờ `chunks.db` là nguồn dữ liệu duy nhất. `chunk` ghi thẳng vào đó, `embed` đọc từ đó, và `faiss_id` khớp với index vì nó chính là khoá chính.
+
+| Vấn đề ở code cũ | Cách xử lý ở đây |
+|---|---|
+| HTML VBPL tách một đơn vị thành nhiều phần tử **cùng `id`** (dòng nối tiếp `data-merged="true"`, hoặc `prov-content` mang id của Điều/Khoản). Phase 3 duyệt từng phần tử và giữ phần tử cuối → chunk trùng `chunk_id` (17.927 id trong `chunks.db` cũ), tiêu đề Điều bị thay bằng dòng sau | Gộp mọi dòng cùng id theo thứ tự đọc: dòng mang class của cấp đó là tiêu đề, các dòng khác là nội dung (`chunking.py`) |
+| Đoạn không id sau Khoản/Điểm (vd. `Trong đó: - P: là…`) bị bỏ, vì chỉ Điều không Khoản mới gom đoạn phía sau | Một quy tắc chung cho mọi đơn vị lá: gom tới khi gặp đơn vị cấu trúc kế tiếp |
+| `article` = `Điều\xa01` (NBSP) hoặc rỗng khi tiêu đề bị thay → `SearchService` lọc `== "Điều 1"` trượt | Chuẩn hoá NFC + khoảng trắng; số Điều lấy từ tiêu đề đã gộp (nhận cả `Điều 5a`, `ĐIỀU 5`) |
+| Phase 3 nạp cả `processed_data.json` vào RAM | Đọc stream bằng `ijson`, ghi SQLite theo batch, `.tmp` → `os.replace` |
+| Phase 4 gọi API **1 chunk/request** (`EMBED_BATCH_SIZE` chỉ là cỡ batch thêm vào index) | Gửi `--batch-size` chunk/request. Batch dính chunk vượt context thì embed lẻ từng chunk |
+| Mọi lỗi API đều "skip chunk" → server sập thì phần còn lại bị bỏ hết | Chỉ bỏ qua lỗi vượt context (ghi `embed_skipped.json`). Lỗi khác dừng lần chạy, chạy lại sẽ resume |
+| Ghi lại toàn bộ `faiss.index` (~3.2GB) sau mỗi 500 vector; `indexed_ids.json` ghi tách rời, crash giữa 2 lần ghi thì lệch | Lưu theo thời gian (`--save-every`, mặc định 300s) và khi dừng (kể cả lỗi/Ctrl+C). Ghi nguyên tử. Trạng thái resume là chính `id_map` của index |
+| `EMBEDDING_DIM = 1024` ghi cứng; `MAX_TOKENS`, `OVERLAP` khai báo nhưng không dùng | Lấy dim từ vector đầu tiên, kiểm tra khớp khi resume. Bỏ hằng số chết |
+| `fp16` lỗi khi index < 200 vector | Số query kiểm tra = min(200, n) |
+
+**Đã đối chiếu** trên 70 văn bản trong `data/processed` (chạy `parse_document` cũ lên cùng input): cùng tập 23.242 `chunk_id`, code cũ sinh thừa 257 bản trùng. 21.736 `embed_text` giống hệt (1.791 trong đó chỉ khác ở NFC/khoảng trắng). Trong phần khác: 1.215 chunk có thêm đoạn trước đây bị bỏ, 236 là id bị trùng ở code cũ, 55 là Điều có tiêu đề bị thay. Output đã được nạp thử bằng `SearchService` của repo cũ mà không phải sửa gì.
+
+Còn lại (giữ như code cũ): đoạn dẫn của Điều/Khoản **không phải lá** (vd. `…bao gồm:` trước các Khoản) không vào chunk nào. Chunk vượt context model bị bỏ qua chứ không cắt nhỏ.
 
 ## Cấu trúc code
 
@@ -97,6 +140,10 @@ legal_rag/
 ├── crawl.py         crawl, retry_failed, reconcile
 ├── structure.py     HTML → cây Phần/Chương/Mục/Điều/Khoản/Điểm
 ├── preprocess.py    Phase 2
+├── chunking.py      Phase 3: cây + HTML → chunk lá, ghi chunks.db
+├── chunk_db.py      schema chunks.db (hợp đồng với SearchService), ghi nguyên tử, đọc tuần tự
+├── embedding.py     Phase 4: EmbeddingClient (API kiểu OpenAI), run_embed (batch, resume)
+├── vector_index.py  FAISS: tạo/đọc/ghi nguyên tử, nén fp16 + kiểm tra recall
 └── __main__.py      CLI
 tests/               test offline với client giả lập + 1 smoke test live
 ```

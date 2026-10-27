@@ -2,8 +2,8 @@
 
 HTML của VBPL đánh dấu từng đơn vị bằng class `prov-*` và `id`, xếp PHẲNG theo thứ tự
 đọc (Khoản, Điểm là anh em của Điều chứ không lồng bên trong). Cây được dựng bằng một
-stack theo thứ bậc cấp. Schema node giữ tương thích với `metadata` mà
-chunk_embedding.py (Phase 3) đang đọc: id, title, level, ptype, orderIndex, children, isLeaf.
+stack theo thứ bậc cấp. Schema node giữ tương thích với `metadata` mà chunking.py (Phase 3)
+và chunk_embedding.py cũ đọc: id, title, level, ptype, orderIndex, children, isLeaf.
 """
 
 from __future__ import annotations
